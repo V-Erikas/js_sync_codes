@@ -2,6 +2,7 @@ import { Permissions, webMethod } from "wix-web-module";
 import wixData from "wix-data";
 import { apiGet } from "backend/b2bClient.web.js";
 import { getState, setState, startLog, finishLog } from "backend/syncHelpers.web.js";
+import { translateMany } from "backend/translate.web.js";
 
 const OPTS = { suppressAuth: true, suppressHooks: true };
 const PER_PAGE = 25;
@@ -40,7 +41,7 @@ function transform(p) {
 function makeHash(p) {
   const e = ext(p);
   const s = [p.name, e.retail_price, e.final_price, p.weight, p.status,
-    attr(p, "description"), attr(p, "brand"),
+    attr(p, "description"), attr(p, "brand"), attr(p, "color"),
     JSON.stringify(e.category_paths || []), JSON.stringify(e.images || [])].join("|");
   let h = 0;
   for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
@@ -70,15 +71,38 @@ async function upsertPage(items) {
   const bySku = {};
   existing.items.forEach(e => { bySku[e.sku] = e; });
 
-  const toSave = [];
+  const pending = [];
   let inserted = 0, updated = 0, skipped = 0;
   for (const r of rows) {
     const cur = bySku[r.mapped.sku];
-    if (!cur) { toSave.push({ ...r.mapped, sourceHash: r.hash }); inserted++; }
-    else if (cur.sourceHash !== r.hash) {
-      toSave.push({ ...cur, ...r.mapped, _id: cur._id, sourceHash: r.hash }); updated++;
-    } else skipped++;
+    if (!cur) { pending.push({ r, cur: null }); inserted++; }
+    else if (cur.sourceHash !== r.hash) { pending.push({ r, cur }); updated++; }
+    else skipped++;
   }
+
+  // Translate name/description/color to Lithuanian for new/changed rows only.
+  const texts = [];
+  pending.forEach(p => texts.push(p.r.mapped.name || "", p.r.mapped.description || "", p.r.mapped.color || ""));
+  let lt = [];
+  let translated = true;
+  if (texts.length) {
+    try { lt = await translateMany(texts, "LT", "EN"); }
+    catch (err) { translated = false; console.warn("Translation failed, saving without LT:", err.message); }
+  }
+
+  const toSave = [];
+  pending.forEach((p, i) => {
+    let tr = {};
+    if (translated) {
+      const b = i * 3;
+      tr = { nameLt: lt[b] || null, descriptionLt: lt[b + 1] || null, colorLt: lt[b + 2] || null };
+    }
+    // If translation failed, don't advance sourceHash so it retries next run.
+    const sourceHash = translated ? p.r.hash : (p.cur ? p.cur.sourceHash : undefined);
+    if (!p.cur) toSave.push({ ...p.r.mapped, ...tr, sourceHash });
+    else toSave.push({ ...p.cur, ...p.r.mapped, ...tr, _id: p.cur._id, sourceHash });
+  });
+
   if (toSave.length) await wixData.bulkSave("b2bProducts", toSave, OPTS);
   return { inserted, updated, skipped };
 }
