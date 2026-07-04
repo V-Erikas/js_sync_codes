@@ -1,0 +1,289 @@
+import { Permissions, webMethod } from "wix-web-module";
+import { fetch } from "wix-fetch";
+import { getSecret } from "wix-secrets-backend";
+
+/**
+ * B2B Checkout API wrapper (ActiveShop).
+ * See checkout_api_doc for the full endpoint reference.
+ *
+ * IMPORTANT: this API uses base path `<host>/rest/<store_code>/...`
+ * (the catalog/stock sync client uses `/eng/rest/...` instead).
+ *
+ * CONCURRENCY: every mutating call runs against `/carts/mine`, i.e. the
+ * active quote of the ONE shared B2B account. Two dropship orders placed at
+ * the same time would clobber each other's active cart. Callers MUST
+ * serialize order placement (queue / single-worker cron). Do not call
+ * placeDropshipOrder concurrently.
+ */
+
+const DEFAULT_HOST = "https://b2b.activeshop.com.pl";
+const DEFAULT_STORE_CODE = "B2B_PL_eng";
+const DEFAULT_PAYMENT_METHOD = "banktransfer";
+
+async function getConfig() {
+  const [host, storeCode, user, pass] = await Promise.all([
+    getSecret("b2b_checkout_host").catch(() => null),
+    getSecret("b2b_checkout_store_code").catch(() => null),
+    getSecret("b2b_checkout_user"),
+    getSecret("b2b_checkout_pass")
+  ]);
+  return {
+    host: host || DEFAULT_HOST,
+    storeCode: storeCode || DEFAULT_STORE_CODE,
+    user,
+    pass
+  };
+}
+
+async function requestToken(cfg) {
+  const res = await fetch(
+    `${cfg.host}/rest/${cfg.storeCode}/V1/integration/customer/token`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: cfg.user, password: cfg.pass })
+    }
+  );
+  if (!res.ok) throw new Error(`CHECKOUT AUTH failed: HTTP ${res.status}`);
+  return res.json(); // customer token (string)
+}
+
+async function api(cfg, token, method, path, body) {
+  const res = await fetch(`${cfg.host}/rest/${cfg.storeCode}/${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "Authorization": `Bearer ${token}`
+    },
+    body: body != null ? JSON.stringify(body) : undefined
+  });
+
+  const raw = await res.text();
+  let data = null;
+  if (raw) { try { data = JSON.parse(raw); } catch { data = raw; } }
+
+  if (res.status === 401) { const e = new Error("CHECKOUT_UNAUTHORIZED"); e.status = 401; throw e; }
+  if (!res.ok) {
+    const detail = typeof data === "string" ? data : JSON.stringify(data);
+    throw new Error(`HTTP ${res.status} on ${path}: ${detail}`);
+  }
+  return data;
+}
+
+// --- individual steps -------------------------------------------------------
+
+async function createQuote(cfg, token) {
+  const quoteId = await api(cfg, token, "POST", "V1/carts/mine");
+  return quoteId; // number
+}
+
+async function addItem(cfg, token, quoteId, sku, qty) {
+  return api(cfg, token, "POST", "V1/carts/mine/items", {
+    cartItem: { sku: String(sku), qty: Number(qty), quote_id: quoteId }
+  });
+}
+
+async function setCurrency(cfg, token, currencyCode) {
+  return api(cfg, token, "POST", "V1/activ-checkout/set-currency", { currencyCode });
+}
+
+async function estimateShipping(cfg, token, address) {
+  return api(cfg, token, "POST", "V1/carts/mine/estimate-shipping-methods", { address });
+}
+
+async function setShipping(cfg, token, address, carrierCode, methodCode) {
+  // returns { payment_methods, totals, extension_attributes }
+  return api(cfg, token, "POST", "V1/carts/mine/shipping-information", {
+    addressInformation: {
+      shipping_address: address,
+      shipping_carrier_code: carrierCode,
+      shipping_method_code: methodCode
+    }
+  });
+}
+
+async function setPaymentInformation(cfg, token, quoteId, method) {
+  return api(cfg, token, "POST", "V1/carts/mine/set-payment-information", {
+    cartId: quoteId,
+    paymentMethod: { method }
+  });
+}
+
+async function syncQuoteParams(cfg, token, comment, orderType) {
+  // returns array of agreements
+  return api(cfg, token, "POST", "V1/activ-checkout/synchronizeQuoteParams", {
+    params: { comment: comment || "", order_type: orderType || "dropshipping" }
+  });
+}
+
+async function placeOrder(cfg, token, method, agreementIds, externalNumber, notificationEmail) {
+  const extension_attributes = { agreement_ids: agreementIds };
+  if (externalNumber) extension_attributes.external_number = String(externalNumber);
+  if (notificationEmail) extension_attributes.notification_email = notificationEmail;
+
+  const orderId = await api(cfg, token, "POST", "V1/carts/mine/payment-information", {
+    paymentMethod: { method, extension_attributes }
+  });
+  return orderId; // order id (string)
+}
+
+function pickCheapestShipping(methods, preferred) {
+  const available = (methods || []).filter(m => m.available);
+  if (!available.length) throw new Error("No shipping methods available for this address");
+  if (preferred && preferred.carrier_code && preferred.method_code) {
+    const match = available.find(
+      m => m.carrier_code === preferred.carrier_code && m.method_code === preferred.method_code
+    );
+    if (match) return match;
+  }
+  return available.reduce((a, b) => (Number(b.amount) < Number(a.amount) ? b : a));
+}
+
+// --- public methods ---------------------------------------------------------
+
+/**
+ * Estimate shipping options for a cart/address (safe to expose to the
+ * checkout page). Creates a temporary quote on the shared account, so keep
+ * this serialized too if used heavily.
+ * @param {{items: Array<{sku:string, qty:number}>, address: object}} input
+ */
+export const estimateB2bShipping = webMethod(Permissions.Admin, async ({ items, address }) => {
+  const cfg = await getConfig();
+  const token = await requestToken(cfg);
+  const quoteId = await createQuote(cfg, token);
+  for (const it of items) await addItem(cfg, token, quoteId, it.sku, it.qty);
+  const methods = await estimateShipping(cfg, token, address);
+  return { quoteId, methods };
+});
+
+/**
+ * Full dropship order flow: token -> quote -> items -> (currency) ->
+ * shipping -> payment -> params -> place order.
+ * Call AFTER the Wix order is paid. Serialize calls (shared account).
+ *
+ * @param {Object} input
+ * @param {Array<{sku:string, qty:number}>} input.items
+ * @param {Object} input.shippingAddress  region_id, country_id, street[], postcode, city, firstname, lastname, company, telephone
+ * @param {{carrier_code:string, method_code:string}} [input.shipping]  preferred method; cheapest available used if omitted/unavailable
+ * @param {string} [input.paymentMethod="banktransfer"]
+ * @param {string} [input.currencyCode]
+ * @param {string} [input.comment]
+ * @param {string} [input.orderType="dropshipping"]
+ * @param {string|number} [input.externalNumber]  e.g. the Wix order number
+ * @param {string} [input.notificationEmail]
+ * @returns {Promise<{orderId:string, quoteId:number, shipping:object, totals:object}>}
+ */
+export const placeDropshipOrder = webMethod(Permissions.Admin, async (input) => {
+  const {
+    items,
+    shippingAddress,
+    shipping,
+    paymentMethod = DEFAULT_PAYMENT_METHOD,
+    currencyCode,
+    comment,
+    orderType = "dropshipping",
+    externalNumber,
+    notificationEmail
+  } = input || {};
+
+  if (!Array.isArray(items) || !items.length) throw new Error("items is required");
+  if (!shippingAddress) throw new Error("shippingAddress is required");
+
+  const cfg = await getConfig();
+  const token = await requestToken(cfg);
+
+  // 1-3. quote + items
+  const quoteId = await createQuote(cfg, token);
+  for (const it of items) await addItem(cfg, token, quoteId, it.sku, it.qty);
+
+  // 4. currency (optional)
+  if (currencyCode) await setCurrency(cfg, token, currencyCode);
+
+  // 5. choose shipping method
+  const methods = await estimateShipping(cfg, token, shippingAddress);
+  const chosen = pickCheapestShipping(methods, shipping);
+
+  // 6. set shipping -> get available payment methods + totals
+  const shipInfo = await setShipping(
+    cfg, token, shippingAddress, chosen.carrier_code, chosen.method_code
+  );
+
+  const paymentAllowed = (shipInfo.payment_methods || []).some(p => p.code === paymentMethod);
+  if (!paymentAllowed) {
+    const codes = (shipInfo.payment_methods || []).map(p => p.code).join(", ");
+    throw new Error(`Payment method "${paymentMethod}" not available. Allowed: ${codes}`);
+  }
+
+  // 7. set payment
+  await setPaymentInformation(cfg, token, quoteId, paymentMethod);
+
+  // 8. params (order_type=dropshipping) -> agreements
+  const agreements = await syncQuoteParams(cfg, token, comment, orderType);
+  const agreementIds = (agreements || [])
+    .filter(a => a.is_required)
+    .map(a => a.id);
+
+  // 9. place order
+  const orderId = await placeOrder(
+    cfg, token, paymentMethod, agreementIds, externalNumber, notificationEmail
+  );
+
+  return {
+    orderId: String(orderId),
+    quoteId,
+    shipping: { carrier_code: chosen.carrier_code, method_code: chosen.method_code, amount: chosen.amount },
+    totals: shipInfo.totals || null
+  };
+});
+
+/**
+ * Fetch tracking statuses for previously placed B2B orders.
+ * @param {string[]} orderIds
+ */
+export const getB2bOrderTracking = webMethod(Permissions.Admin, async (orderIds) => {
+  const cfg = await getConfig();
+  const token = await requestToken(cfg);
+  return api(cfg, token, "POST", "V1/orderTracking", { orderIds: (orderIds || []).map(String) });
+});
+
+// --- testing (safe, non-destructive) ---------------------------------------
+
+/**
+ * Verifies secrets + host/store code by requesting a customer token.
+ * Does NOT create a quote or place an order.
+ */
+export const testCheckoutAuth = webMethod(Permissions.Admin, async () => {
+  const cfg = await getConfig();
+  const token = await requestToken(cfg);
+  return {
+    host: cfg.host,
+    storeCode: cfg.storeCode,
+    gotToken: !!token,
+    preview: String(token).slice(0, 12) + "..."
+  };
+});
+
+/**
+ * Creates a temporary quote, adds items and returns shipping options + totals.
+ * Stops BEFORE setting payment / placing the order (no real order is created).
+ * @param {{items: Array<{sku:string, qty:number}>, address: object}} input
+ */
+export const testCheckoutDryRun = webMethod(Permissions.Admin, async ({ items, address }) => {
+  const cfg = await getConfig();
+  const token = await requestToken(cfg);
+  const quoteId = await createQuote(cfg, token);
+  const added = [];
+  for (const it of items) added.push(await addItem(cfg, token, quoteId, it.sku, it.qty));
+  const methods = await estimateShipping(cfg, token, address);
+  const chosen = pickCheapestShipping(methods, null);
+  const shipInfo = await setShipping(cfg, token, address, chosen.carrier_code, chosen.method_code);
+  return {
+    quoteId,
+    added,
+    shippingMethods: methods,
+    chosen,
+    paymentMethods: shipInfo.payment_methods,
+    totals: shipInfo.totals
+  };
+});
